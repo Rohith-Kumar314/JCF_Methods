@@ -10,22 +10,28 @@
 
 0. [What's New in Angular 22](#0-whats-new-in-angular-22)
 1. [The One Mental Model That Ends the Confusion](#1-the-one-mental-model-that-ends-the-confusion)
-2. [Template Syntax Basics](#2-template-syntax-basics-everything-that-looks-like-or-)
-3. [Parent → Child with `input()`](#3-parent--child-input)
-4. [Child → Parent with `output()`](#4-child--parent-output)
-5. [Two-Way Binding `[( )]` with `model()`](#5-two-way-binding--with-model)
+2. [Template Syntax Basics: Everything That Looks Like `[]` or `()`](#2-template-syntax-basics-everything-that-looks-like--or-)
+3. [Parent → Child: `input()`](#3-parent--child-input)
+4. [Child → Parent: `output()`](#4-child--parent-output)
+5. [Two-Way Binding `[( )]` with `model()`](#5-two-way-binding---with-model)
 6. [Template Reference Variables and `viewChild`](#6-template-reference-variables-and-viewchild)
 7. [Content Projection (`ng-content`)](#7-content-projection-ng-content)
 8. [Services: Talking Across Any Components](#8-services-talking-across-any-components)
 9. [RxJS Subjects and Signals Interop](#9-rxjs-subjects-and-signals-interop)
 10. [Router-Based Communication](#10-router-based-communication)
 11. [Advanced Patterns](#11-advanced-patterns)
-12. [Decision Guide: Which Technique Do I Use?](#12-decision-guide-which-technique-do-i-use)
-13. [Top 12 Mistakes (and Fixes)](#13-top-12-mistakes-and-fixes)
-14. [Cheat Sheet](#14-cheat-sheet)
-15. [Practice: Drills](#15-practice-drills)
-16. [Practice: Build the "TaskFlow" App](#16-practice-build-the-taskflow-app)
-17. [Answers to Drills and Reference Solution Pieces](#17-answers-to-drills-and-reference-solution-pieces)
+12. [Dynamic Components and Programmatic Communication](#12-dynamic-components-and-programmatic-communication)
+13. [The Dependency Injection Tree as a Communication Channel](#13-the-dependency-injection-tree-as-a-communication-channel)
+14. [Directives: Communicating With Behaviour](#14-directives-communicating-with-behaviour)
+15. [Other Channels and Event APIs](#15-other-channels-and-event-apis)
+16. [Signals, Lifecycle and Queries in Communication](#16-signals-lifecycle-and-queries-in-communication)
+17. [Testing Component Communication](#17-testing-component-communication)
+18. [Decision Guide: Which Technique Do I Use?](#18-decision-guide-which-technique-do-i-use)
+19. [Top 16 Mistakes (and Fixes)](#19-top-16-mistakes-and-fixes)
+20. [Cheat Sheet](#20-cheat-sheet)
+21. [Practice: Drills](#21-practice-drills)
+22. [Practice: Build the "TaskFlow" App](#22-practice-build-the-taskflow-app)
+23. [Answers to Drills and Reference Solution Pieces](#23-answers-to-drills-and-reference-solution-pieces)
 
 ---
 
@@ -1196,7 +1202,573 @@ Start with services. Move up only when you feel real pain.
 
 ---
 
-## 12. Decision Guide: Which Technique Do I Use?
+## 12. Dynamic Components and Programmatic Communication
+
+So far every child was written in the parent's template (`<app-child />`). Sometimes the component is only known **at runtime**: dialogs, toasts, dashboard widgets chosen by configuration, table cells rendered by a column definition, plugin systems. The question becomes: *how do I still do `[]`, `()` and `[()]` when there is no template tag?*
+
+### 12.1 `ngComponentOutlet`: dynamic component in a template
+
+```ts
+import { NgComponentOutlet } from '@angular/common';
+
+@Component({
+  selector: 'app-dashboard',
+  imports: [NgComponentOutlet],
+  template: `
+    @for (w of widgets(); track w.id) {
+      <ng-container
+        [ngComponentOutlet]="w.component"
+        [ngComponentOutletInputs]="w.inputs"
+        #outlet="ngComponentOutlet" />
+    }
+  `,
+})
+export class DashboardComponent {
+  widgets = signal([
+    { id: 1, component: StatsBarComponent, inputs: {} },
+    { id: 2, component: UserCardComponent, inputs: { name: 'Asha', age: 31 } },
+  ]);
+}
+```
+
+- **Data in:** `ngComponentOutletInputs` is the dynamic version of `[name]="..."`. If the object changes, Angular updates the inputs.
+- **Instance access:** `#outlet="ngComponentOutlet"` gives you the outlet; `outlet.componentInstance` is the created component (imperative, like `viewChild`).
+- **Events out:** the outlet has **no outputs support**. To get events from a dynamic component use `createComponent` with `outputBinding` (next section), or pass a callback/signal/service in.
+- Other options: `ngComponentOutletInjector` (custom injector) and `ngComponentOutletContent` (projected nodes).
+
+### 12.2 `createComponent` with `bindings` (Angular 20+)
+
+`ViewContainerRef.createComponent()` and the standalone `createComponent()` accept a `bindings` array. The three helpers are the **programmatic twins of the three template syntaxes**:
+
+| Template | Programmatic | Meaning |
+|---|---|---|
+| `[x]="value"` | `inputBinding('x', () => value)` | data INTO input `x` (pass a signal or a function; it stays reactive) |
+| `(x)="fn($event)"` | `outputBinding<T>('x', fn)` | LISTEN to output `x` |
+| `[(x)]="sig"` | `twoWayBinding('x', sig)` | sync `model` `x` with a writable signal |
+
+```ts
+import { inputBinding, outputBinding, twoWayBinding, viewChild, ViewContainerRef, signal } from '@angular/core';
+
+@Component({
+  selector: 'app-host',
+  template: `<button (click)="show()">Show warning</button><ng-container #slot />`,
+})
+export class HostComponent {
+  private slot = viewChild.required('slot', { read: ViewContainerRef });
+  expanded = signal(true);
+  canClose = signal(true);
+
+  show() {
+    this.slot().createComponent(WarningComponent, {
+      bindings: [
+        inputBinding('canClose', this.canClose),          // [canClose]="canClose"
+        twoWayBinding('isExpanded', this.expanded),       // [(isExpanded)]="expanded"
+        outputBinding<boolean>('closed', ok => console.log('closed with', ok)),  // (closed)="..."
+      ],
+      // directives: [FocusTrap],   // you can attach directives too
+    });
+  }
+}
+```
+
+Rules:
+- Use `bindings` **instead of** `componentRef.setInput(...)` / manual subscribes for the same property. Mixing them can double-initialize or conflict.
+- The first argument is the child's **public** input/output name (its alias, if it has one).
+- `ComponentRef.setInput('x', v)` still exists and is fine for simple one-shot cases.
+
+### 12.3 Real-world pattern: a promise-based dialog service
+
+A component anywhere calls `await dialog.confirm('Delete?')`. The service creates the dialog dynamically, wires `[message]` in and `(closed)` out, and turns the output into a resolved `Promise`:
+
+```ts
+// confirm-dialog.component.ts
+@Component({
+  selector: 'app-confirm-dialog',
+  template: `
+    <div class="backdrop">
+      <div class="dialog">
+        <p>{{ message() }}</p>
+        <button (click)="closed.emit(false)">Cancel</button>
+        <button (click)="closed.emit(true)">OK</button>
+      </div>
+    </div>
+  `,
+})
+export class ConfirmDialogComponent {
+  message = input.required<string>();
+  closed = output<boolean>();
+}
+```
+
+```ts
+// dialog.service.ts
+import { ApplicationRef, EnvironmentInjector, createComponent, inject, inputBinding, outputBinding, Service } from '@angular/core';
+
+@Service()
+export class DialogService {
+  private appRef = inject(ApplicationRef);
+  private injector = inject(EnvironmentInjector);
+
+  confirm(message: string): Promise<boolean> {
+    return new Promise(resolve => {
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+
+      const ref = createComponent(ConfirmDialogComponent, {
+        environmentInjector: this.injector,
+        hostElement: host,
+        bindings: [
+          inputBinding('message', () => message),
+          outputBinding<boolean>('closed', result => {
+            resolve(result);
+            this.appRef.detachView(ref.hostView);
+            ref.destroy();
+            host.remove();
+          }),
+        ],
+      });
+      this.appRef.attachView(ref.hostView);   // make Angular check it
+    });
+  }
+}
+```
+
+```ts
+async remove(id: number) {
+  if (await this.dialog.confirm('Delete this task?')) this.svc.remove(id);
+}
+```
+
+> In production apps use **Angular CDK Overlay/Dialog** or **Angular Material's `MatDialog`** (`dialog.open(Comp, { data })` + `afterClosed()`). They solve focus trapping, scroll locking, stacking and accessibility. The code above shows what is happening underneath.
+
+---
+
+## 13. The Dependency Injection Tree as a Communication Channel
+
+Angular creates a tree of **injectors** that mirrors your component tree. "Which instance of a service do I get?" depends on where you stand in the tree. This is how services, parents and wrapper components talk implicitly.
+
+### 13.1 Lookup order
+
+```
+Element injector (my own component/directive)
+  → parent element injector → … up the component tree …
+    → Route/Environment injector
+      → Root injector (providedIn: 'root', @Service())
+```
+
+`inject(Token)` walks **up** until it finds a provider. Same token provided at two levels = two different instances; the nearest wins.
+
+### 13.2 `providers` vs `viewProviders`
+
+```ts
+@Component({
+  selector: 'app-panel',
+  providers:     [PanelState],   // visible to my view children AND to content projected into me
+  viewProviders: [PanelTheme],   // visible ONLY to my own view children, NOT to projected content
+  template: `<ng-content />`,
+})
+```
+
+Use `viewProviders` for implementation details that projected (parent-supplied) content must not touch.
+
+### 13.3 Resolution modifiers
+
+```ts
+const parent = inject(AccordionComponent, { optional: true });   // don't throw if not inside one
+const outer  = inject(ThemeService,       { skipSelf: true });   // ignore MY provider, ask my ancestors
+const local  = inject(FormState,          { self: true });       // only my own injector
+const hosted = inject(Panel,              { host: true });       // stop at the host element boundary
+```
+
+Typical use: **compound components** (section 11.5) should use `{ optional: true }` to give a helpful error when a child is used outside its parent, and `skipSelf` for nested providers that extend an outer one (nested theme, nested form group).
+
+### 13.4 When the DI tree is the right tool
+
+| Situation | Use |
+|---|---|
+| Child needs a reference to its wrapper (`Tab` inside `Tabs`) | `inject(Parent)` |
+| Many components in a subtree share state, but each *instance* of the subtree should have its own | component-level `providers` |
+| An optional enclosing context (inside a `<form-field>` or not) | `inject(X, { optional: true })` |
+| App-wide config | `InjectionToken` (section 11.6) |
+
+Don't use it as a hidden global event bus; implicit coupling is hard to read. Prefer explicit inputs/outputs when the components are direct neighbours.
+
+---
+
+## 14. Directives: Communicating With Behaviour
+
+Directives use **exactly the same syntax**. An attribute directive is just "a component without a template", so inputs `[ ]`, outputs `( )` and `exportAs` all work.
+
+### 14.1 Inputs and outputs on a directive
+
+```ts
+@Directive({
+  selector: '[appClickOutside]',
+  host: { '(document:click)': 'onDocClick($event)' },
+})
+export class ClickOutsideDirective {
+  private el = inject(ElementRef<HTMLElement>);
+  clickOutside = output<MouseEvent>();            // (clickOutside)="..."
+
+  onDocClick(e: MouseEvent) {
+    if (!this.el.nativeElement.contains(e.target as Node)) this.clickOutside.emit(e);
+  }
+}
+```
+
+```html
+<div class="menu" appClickOutside (clickOutside)="open.set(false)">…</div>
+```
+
+```ts
+@Directive({ selector: '[appHighlight]', host: { '[style.background]': 'color()' } })
+export class HighlightDirective {
+  color = input('yellow', { alias: 'appHighlight' });   // [appHighlight]="'pink'"
+}
+```
+
+```html
+<p [appHighlight]="isUrgent() ? 'tomato' : 'lightgreen'">Hi</p>
+```
+
+### 14.2 `exportAs`: grab the directive instance in the template
+
+```ts
+@Directive({ selector: '[appTooltip]', exportAs: 'appTooltip' })
+export class TooltipDirective {
+  visible = signal(false);
+  show() { this.visible.set(true); }
+  hide() { this.visible.set(false); }
+}
+```
+
+```html
+<button appTooltip #tip="appTooltip" (mouseenter)="tip.show()" (mouseleave)="tip.hide()">Hover</button>
+@if (tip.visible()) { <span class="tip">Hello</span> }
+```
+
+`#tip` (no `=`) gives the DOM element; `#tip="appTooltip"` gives the directive instance.
+
+### 14.3 `hostDirectives`: reuse behaviour inside a component
+
+A component can **attach directives to itself** and choose which of their inputs/outputs to expose to its own users:
+
+```ts
+@Component({
+  selector: 'app-fancy-button',
+  hostDirectives: [
+    { directive: ClickOutsideDirective, outputs: ['clickOutside'] },
+    { directive: HighlightDirective,    inputs:  ['appHighlight'] },
+  ],
+  template: `<ng-content />`,
+})
+export class FancyButtonComponent {}
+```
+
+```html
+<app-fancy-button [appHighlight]="'gold'" (clickOutside)="close()">Go</app-fancy-button>
+```
+
+Composition instead of inheritance. Only what you list in `inputs` / `outputs` is public.
+
+---
+
+## 15. Other Channels and Event APIs
+
+### 15.1 Outputs do **not** bubble. DOM events **do**.
+
+```html
+<app-card (click)="log('card clicked')"> <button>Inside</button> </app-card>
+```
+
+`(click)` on a component tag listens to the **native DOM click on its host element**. That fires for clicks on *anything inside it*, because native events bubble. Your own `output()` events travel only to the direct parent that binds them. If an output must pass through several levels, **re-emit it at each level** (as in TaskFlow Level 1), or use a service.
+
+Naming outputs `click`, `change`, `input`, `focus` is therefore a bug magnet: the parent's handler fires for the native event *and* your output. Use specific names (`itemSelected`).
+
+### 15.2 RxJS interop for outputs
+
+```ts
+import { outputFromObservable, outputToObservable } from '@angular/core/rxjs-interop';
+
+export class SearchBoxComponent {
+  private query$ = new Subject<string>();
+  // expose an Observable as an output
+  searched = outputFromObservable(this.query$.pipe(debounceTime(300), distinctUntilChanged()));
+}
+
+// consume any output as an Observable (e.g. in a service or a directive)
+outputToObservable(this.child.searched).pipe(takeUntilDestroyed()).subscribe(console.log);
+```
+
+### 15.3 Global events
+
+```ts
+host: {
+  '(window:resize)': 'onResize()',
+  '(document:keydown.escape)': 'close()',
+}
+```
+
+Angular removes these listeners automatically when the component is destroyed. Prefer this to `addEventListener` by hand.
+
+### 15.4 Outside the component tree
+
+| Channel | Use for | Notes |
+|---|---|---|
+| `BroadcastChannel` | Syncing **browser tabs** of the same origin | Not available on the server (SSR): guard with `isPlatformBrowser` |
+| `storage` event (`window:storage`) | Cross-tab updates via `localStorage` | Fires in *other* tabs only |
+| `window.postMessage` | Parent page ↔ **iframe** / popup | Always check `event.origin` |
+| Angular Elements (`createCustomElement`) | Using Angular components in non-Angular pages | Inputs become element properties; outputs become DOM `CustomEvent`s |
+
+```ts
+@Service()
+export class CrossTabSync {
+  private channel = new BroadcastChannel('taskflow');
+  readonly last = signal<unknown>(null);
+
+  constructor() {
+    this.channel.onmessage = e => this.last.set(e.data);
+    inject(DestroyRef).onDestroy(() => this.channel.close());
+  }
+  post(data: unknown) { this.channel.postMessage(data); }
+}
+```
+
+### 15.5 Router outlets
+
+```html
+<!-- the parent shell sees which page component was activated -->
+<router-outlet (activate)="onActivate($event)" (deactivate)="onDeactivate()" />
+
+<!-- the shell hands data to whichever routed component shows up -->
+<router-outlet [routerOutletData]="{ theme: theme() }" />
+```
+
+```ts
+// inside any routed component
+const data = inject(ROUTER_OUTLET_DATA) as Signal<{ theme: string }>;
+```
+
+`routerOutletData` is the router's equivalent of "input into whichever child is rendered", without every route needing to know about it.
+
+---
+
+## 16. Signals, Lifecycle and Queries in Communication
+
+### 16.1 `linkedSignal`: a local, editable copy of an input
+
+Inputs are read-only. When the child needs a **draft** it can edit, but that resets whenever the parent sends a new value, use `linkedSignal`:
+
+```ts
+export class TaskEditRowComponent {
+  task = input.required<Task>();
+  saved = output<{ id: number; title: string }>();
+
+  draftTitle = linkedSignal(() => this.task().title);   // follows the input, but is writable
+
+  save() { this.saved.emit({ id: this.task().id, title: this.draftTitle() }); }
+}
+```
+
+```html
+<input [value]="draftTitle()" (input)="draftTitle.set($any($event.target).value)" />
+<button (click)="save()">Save</button>
+```
+
+If the parent updates `task`, `draftTitle` resets to the new title. This pattern replaces most old `ngOnChanges` code.
+
+### 16.2 Which reactive tool when?
+
+| Need | Use |
+|---|---|
+| Derived value from inputs/signals | `computed()` |
+| Writable value that resets from a source | `linkedSignal()` |
+| Side effect (log, storage, imperative API) | `effect()` |
+| Read a signal without subscribing to it (inside `effect`/`computed`) | `untracked(() => sig())` |
+| Run something once, after the DOM exists | `afterNextRender()` |
+| Compare previous vs current input value | `ngOnChanges` (still valid) or keep previous in a variable inside `effect` |
+
+### 16.3 Timing: when is each thing available?
+
+| Moment | Inputs | `viewChild` / DOM |
+|---|---|---|
+| Constructor | Not yet. Reading a **required** input throws (NG0950) | No |
+| Inside `effect()` / `computed()` | Yes (re-runs when they change) | After first render |
+| `ngOnInit` | Yes | No |
+| `afterNextRender` | Yes | **Yes** |
+
+### 16.4 `contentChildren` / `viewChildren`
+
+Instead of children registering with their parent (section 11.5), the wrapper can **query** them:
+
+```ts
+@Component({
+  selector: 'app-tabs',
+  template: `
+    @for (t of tabs(); track t.title()) {
+      <button (click)="active.set($index)">{{ t.title() }}</button>
+    }
+    <ng-content />
+  `,
+})
+export class TabsComponent {
+  tabs = contentChildren(TabComponent);      // projected <app-tab> elements
+  active = signal(0);
+}
+```
+
+`contentChildren` sees only direct content by default; add `{ descendants: true }` to look deeper.
+
+### 16.5 `@let`: name a value inside a template
+
+```html
+@let user = userService.current();
+@let total = cart.total();
+<p>{{ user.name }} owes {{ total }}</p>
+<app-invoice [user]="user" [amount]="total" />
+```
+
+### 16.6 The `ExpressionChangedAfterItHasBeenCheckedError`
+
+Dev mode throws this when a value used in a template changes **after** Angular already checked it in the same pass. Common communication cause: a child **emits an output during its own initialization** and the parent updates a property that was already rendered.
+
+```ts
+// ❌ child
+ngOnInit() { this.ready.emit(true); }     // parent changes a bound value mid-check
+```
+
+Fixes: keep the state in a **signal** (signals notify Angular properly), emit later (`afterNextRender`, user event), or restructure so the parent owns the state from the start.
+
+---
+
+## 17. Testing Component Communication
+
+If you can test the contract, you can refactor safely. Examples use Vitest (the default in new projects); with Jasmine replace `vi.fn()` with `jasmine.createSpy()`.
+
+### 17.1 Inputs and outputs of a single component
+
+```ts
+describe('TaskItemComponent', () => {
+  const task = { id: 7, title: 'Learn Angular', done: false, priority: 2 };
+
+  function setup() {
+    const fixture = TestBed.createComponent(TaskItemComponent);
+    fixture.componentRef.setInput('task', task);          // like [task]="task"
+    return fixture;
+  }
+
+  it('renders the title from the input', async () => {
+    const fixture = setup();
+    await fixture.whenStable();
+    expect(fixture.nativeElement.textContent).toContain('Learn Angular');
+  });
+
+  it('emits the id when deleted', async () => {
+    const fixture = setup();
+    await fixture.whenStable();
+
+    const spy = vi.fn();
+    fixture.componentInstance.deleted.subscribe(spy);     // like (deleted)="spy($event)"
+    fixture.nativeElement.querySelector('button:last-of-type').click();
+
+    expect(spy).toHaveBeenCalledWith(7);
+  });
+});
+```
+
+### 17.2 Test it exactly like a parent would (host component)
+
+When the interesting part is the wiring itself, test through a tiny host:
+
+```ts
+@Component({
+  imports: [TaskItemComponent],
+  template: `<app-task-item [task]="task" (deleted)="removed = $event" />`,
+})
+class HostComponent {
+  task = { id: 7, title: 'x', done: false, priority: 1 };
+  removed?: number;
+}
+
+it('parent receives the deleted id', async () => {
+  const fixture = TestBed.createComponent(HostComponent);
+  await fixture.whenStable();
+  fixture.nativeElement.querySelector('button:last-of-type').click();
+  expect(fixture.componentInstance.removed).toBe(7);
+});
+```
+
+### 17.3 Services: unit-test them, fake them in component tests
+
+```ts
+// real service: pure logic, no component needed
+it('computes the total', () => {
+  const cart = TestBed.inject(CartService);
+  cart.add({ id: 1, name: 'Pen', price: 10 });
+  cart.add({ id: 1, name: 'Pen', price: 10 });
+  expect(cart.total()).toBe(20);
+});
+
+// component test with a fake service
+TestBed.configureTestingModule({
+  providers: [{ provide: CartService, useValue: { count: signal(3), total: signal(30) } }],
+});
+```
+
+Two unrelated components sharing a service? Create both, call the service from the test, `await fixture.whenStable()`, and assert the second one's text changed.
+
+### 17.4 Routed components with input binding
+
+```ts
+TestBed.configureTestingModule({
+  providers: [provideRouter(routes, withComponentInputBinding())],
+});
+
+it('binds :id and ?edit to inputs', async () => {
+  const harness = await RouterTestingHarness.create();
+  const page = await harness.navigateByUrl('/tasks/3?edit=true', TaskDetailPageComponent);
+  expect(page.id()).toBe('3');
+  expect(page.edit()).toBe(true);
+});
+```
+
+### 17.5 What to test and what not to
+
+| Test | Don't test |
+|---|---|
+| "Given this input, it renders X" | Angular's own binding mechanics |
+| "When the user clicks, the output emits Y" | The child's internals from the parent's test |
+| "The service state changes after `add()`" | Private fields |
+| "Parent wires child output to the right action" (host test) | Everything in one giant end-to-end component test |
+
+---
+
+## 18. Decision Guide: Which Technique Do I Use?
+
+### Complete map of communication mechanisms
+
+| # | Mechanism | Direction | Relationship | Section |
+|---|---|---|---|---|
+| 1 | `input()` / `[x]="…"` | down | parent → child | 3 |
+| 2 | `output()` / `(x)="…"` | up | child → parent | 4 |
+| 3 | `model()` / `[(x)]="…"` | both | parent ↔ child | 5 |
+| 4 | `#ref`, `viewChild` | down (commands) | parent → child instance | 6 |
+| 5 | `ng-content`, `ng-template` | down (markup) | parent → child | 7 |
+| 6 | `contentChild(ren)` / `viewChild(ren)` | up (read children) | wrapper reads its children | 6, 16 |
+| 7 | Service + signals | any | any component | 8 |
+| 8 | Subjects / Observables | events | any component | 9 |
+| 9 | Resources (`httpResource`) | data in | component ← server | 9.5 |
+| 10 | Router params, query, data, state, outlet data | down | URL/shell → routed component | 10, 15.5 |
+| 11 | DI tree (`inject(Parent)`, `providers`) | any | scoped / compound components | 11.5, 13 |
+| 12 | Host bindings / listeners | in / out | component ↔ its own host element | 11.4 |
+| 13 | Directives (`exportAs`, `hostDirectives`) | both | behaviour attached to elements | 14 |
+| 14 | Dynamic components (`ngComponentOutlet`, `createComponent` + bindings) | both | runtime-chosen components | 12 |
+| 15 | Forms (`[formField]`, `FormValueControl`) | both | form ↔ custom control | 11.7, 11.8 |
+| 16 | Native DOM events, `CustomEvent` | up (bubbling) | child DOM → ancestors | 15.1 |
+| 17 | `BroadcastChannel`, `storage`, `postMessage`, Angular Elements | any | across tabs, iframes, non-Angular pages | 15.4 |
+
+If a situation isn't in this table, it's probably not component communication.
+
 
 ```
 Is the other component my direct CHILD (it's in my template)?
@@ -1205,7 +1777,9 @@ Is the other component my direct CHILD (it's in my template)?
 │   ├─ It needs to notify me ............................. output()  (event)="fn($event)"
 │   ├─ Both need to stay in sync on one value ............ model()   [(prop)]="x"
 │   ├─ I want to give it HTML/templates .................. <ng-content> / ng-template
-│   └─ I need to trigger its method (focus, open, reset).. #ref or viewChild()
+│   ├─ I need to trigger its method (focus, open, reset).. #ref or viewChild()
+│   ├─ It is only known at runtime (dialog, widget) ....... ngComponentOutlet / createComponent + bindings
+│   └─ I need a local editable copy of its input ......... linkedSignal()
 │
 ├─ It's my PARENT (compound component) ................... inject(ParentComponent)
 │
@@ -1214,12 +1788,14 @@ Is the other component my direct CHILD (it's in my template)?
     ├─ One-off EVENTS (toast, "saved") .................... Service with Subject
     ├─ Data identified by URL (id, filters) ............... Router params / query params
     ├─ Whole feature with complex state ................... NgRx SignalStore
+    ├─ Across browser tabs / iframes ...................... BroadcastChannel / postMessage
+    ├─ Reusable behaviour on any element .................. Directive (+ hostDirectives)
     └─ Siblings, only 2 of them, same parent .............. Via parent: A (event)→parent→[input] B
 ```
 
 ---
 
-## 13. Top 12 Mistakes (and Fixes)
+## 19. Top 16 Mistakes (and Fixes)
 
 | # | Mistake | Fix |
 |---|---|---|
@@ -1235,10 +1811,14 @@ Is the other component my direct CHILD (it's in my template)?
 | 10 | Subscribing in a component without unsubscribing | `async` pipe, `toSignal`, or `takeUntilDestroyed()` |
 | 11 | Using a service for everything, even simple parent→child | Prefer input/output for direct children |
 | 12 | Two-way binding everywhere → can't trace changes | One-way `input` + `output` for anything with logic |
+| 13 | Expecting an `output()` to bubble up several levels | Outputs reach only the direct parent: re-emit, or use a service (15.1) |
+| 14 | `ExpressionChangedAfterItHasBeenChecked` after a child emits in `ngOnInit` | Keep state in signals; emit from events or `afterNextRender` (16.6) |
+| 15 | Mixing `setInput` / manual subscribes with `bindings` on a dynamic component | Use `bindings` for everything on that component (12.2) |
+| 16 | Provided a service in a component by accident and now each component has its own copy | Provide it once (`@Service()` root) unless you *want* per-instance state (8.3, 13) |
 
 ---
 
-## 14. Cheat Sheet
+## 20. Cheat Sheet
 
 ```html
 {{ value() }}                           <!-- text interpolation -->
@@ -1264,6 +1844,17 @@ value  = model(0);                      // two-way  → input + output "valueCha
 child  = viewChild.required(Child);     // from my own template
 kids   = viewChildren(Child);
 slot   = contentChild(Foo);             // from projected content
+
+// DYNAMIC
+<ng-container [ngComponentOutlet]="cmp" [ngComponentOutletInputs]="{ a: 1 }" />
+vcr.createComponent(Cmp, { bindings: [
+  inputBinding('x', sig),  outputBinding('done', fn),  twoWayBinding('v', sig2) ] });
+
+// DIRECTIVES / DI
+@Directive({ selector: '[appX]', exportAs: 'appX' })     // #r="appX"
+hostDirectives: [{ directive: X, inputs: ['a'], outputs: ['b'] }]
+inject(Parent, { optional: true, skipSelf: true })
+linkedSignal(() => input())             // editable copy that resets
 
 // SHARING
 @Service() class MyService {}           // v22: root-provided service (uses inject())
@@ -1291,11 +1882,11 @@ user = httpResource<User>(() => `/api/users/${id()}`);   // stable in v22
 
 ---
 
-## 15. Practice: Drills
+## 21. Practice: Drills
 
 ### Drill A: `[ ]`, `( )`, `[( )]`, or nothing?
 
-Fill in the correct syntax. (Answers in section 17.)
+Fill in the correct syntax. (Answers in section 23.)
 
 ```html
 1.  <app-badge  ___  label="New"  />                          <!-- constant string -->
@@ -1339,11 +1930,27 @@ Pick one: *input / output / model / viewChild / ng-content / service / router*
 7. Shows the number of items in the cart on every page.
 8. A table column where the parent decides how each cell looks.
 
+
+### Drill D: Advanced scenarios
+
+Name the best tool and the one-line reason:
+
+1. A confirm popup opened from a service that returns `true`/`false` to the caller.
+2. A dashboard whose widgets (components) come from a JSON config.
+3. A `Tab` component that needs to know which `Tabs` wrapper it lives in.
+4. A child needs an editable copy of `task.title` that resets whenever the parent sends a different task.
+5. Two browser tabs of the app must stay in sync.
+6. Close a dropdown when the user clicks anywhere else on the page.
+7. A custom date picker used inside `[formField]`.
+8. A directive instance must be controlled from the template (`tip.show()`).
+9. A wrapper shows a header for each `<app-tab>` placed inside it.
+10. You wrote `<app-card (click)="x()">` and `x()` fires when clicking a button *inside* the card. Why?
+
 ---
 
-## 16. Practice: Build the "TaskFlow" App
+## 22. Practice: Build the "TaskFlow" App
 
-A small task manager that makes you use **every** technique. Build it level by level. Each level has **requirements**, **acceptance checks** and **hints**. Don't peek at the solution pieces in section 17 until you've tried.
+A small task manager that makes you use **every** technique. Build it level by level. Each level has **requirements**, **acceptance checks** and **hints**. Don't peek at the solution pieces in section 23 until you've tried.
 
 ### Setup
 
@@ -1373,6 +1980,8 @@ src/app/
   pages/
     board-page/      (smart)
     task-detail-page/                Level 5
+  directives/click-outside.ts        Level 7
+  services/dialog.service.ts         Level 7
 ```
 
 ```ts
@@ -1475,18 +2084,33 @@ export interface Task {
 3. Draw (on paper) the data-flow diagram of your app. Label every arrow as *input*, *output*, *model*, *service*, or *router*.
 4. Write a one-sentence justification for each place you used a service instead of input/output.
 
+### Level 7: Advanced communication (stretch)
+
+Do this after Levels 1 to 6 work.
+
+1. **Promise dialog:** build `DialogService.confirm(message): Promise<boolean>` with `createComponent` + `inputBinding` / `outputBinding` (section 12.3). Use it so deleting a task asks "Delete this task?" first.
+2. **Directive with an output:** write `appClickOutside` (section 14.1). Use it on a "priority" popup menu in the task form so clicking elsewhere closes it.
+3. **Cross-tab sync:** with `BroadcastChannel`, when you add/toggle/remove a task in one browser tab, the other tab updates without refresh. *Hint:* put the new tasks array in the message, and only **post** from the service's methods, never from the `effect` that saves to storage (otherwise two tabs echo forever).
+4. **Dynamic dashboard:** render a list of `{ component, inputs }` widgets on the board page with `ngComponentOutlet`. Add at least two widgets (stats and "high-priority tasks").
+5. **`linkedSignal` draft:** add an inline "edit title" row component that keeps a draft and emits `saved` only when you press Save; changing the task from outside resets the draft.
+6. **Tests:** write one test for each of: the dialog service (resolves `false` on cancel), `appClickOutside` (emits on outside click only), `TaskItem` output, and `TaskService.add`.
+
+**Acceptance:** two tabs stay in sync; deleting always asks first; clicking outside closes the menu; every new piece has a test.
+
 **Self-grading checklist**
 
 - [ ] I never typed `[` or `(` without knowing whether the name on the left belongs to the child/element.
 - [ ] No child mutates its inputs.
 - [ ] Every component is either clearly *smart* or clearly *dumb*.
 - [ ] No manual `subscribe()` without cleanup (or I used `httpResource` / `toSignal`).
+- [ ] I know why `output()` doesn't bubble but `(click)` on a component tag does.
+- [ ] I can write the programmatic twin (`inputBinding`, `outputBinding`, `twoWayBinding`) of any template binding.
 - [ ] I never mutate arrays/objects held in signals or received as inputs.
 - [ ] I can explain `[(x)]` as `[x]` + `(xChange)` from memory.
 
 ---
 
-## 17. Answers to Drills and Reference Solution Pieces
+## 23. Answers to Drills and Reference Solution Pieces
 
 ### Drill A answers
 
@@ -1522,6 +2146,19 @@ export interface Task {
 8. **ng-content / ngTemplateOutlet** with a `contentChild` template.
 
 ---
+
+### Drill D answers
+
+1. **`createComponent` + `inputBinding`/`outputBinding`** inside a service (section 12.3); the output resolves a `Promise`.
+2. **`ngComponentOutlet`** with `ngComponentOutletInputs` (12.1).
+3. **`inject(TabsComponent)`** (DI tree, 11.5/13), or let `Tabs` use `contentChildren` instead (16.4).
+4. **`linkedSignal(() => task().title)`** (16.1).
+5. **`BroadcastChannel`** (or the `storage` event) wrapped in a service (15.4).
+6. **A directive** such as `appClickOutside` with an output (14.1), or `(document:click)` host listener.
+7. **`FormValueControl`** (11.8).
+8. **`exportAs`** + `#tip="appTooltip"` (14.2).
+9. **`contentChildren(TabComponent)`** (16.4).
+10. **Native DOM events bubble.** `(click)` on a component tag listens to the host element's DOM click, which receives clicks from inside. Outputs do not bubble (15.1).
 
 ### Reference solution pieces for TaskFlow
 
@@ -1806,6 +2443,68 @@ it('emits toggled with the task id', () => {
 
   fixture.nativeElement.querySelector('input[type=checkbox]').click();
   expect(received).toBe(7);
+});
+```
+
+#### Level 7: key pieces
+
+`CrossTabSync` is the service from section 15.4, typed for tasks. Wire it into `TaskService`:
+
+```ts
+@Service()
+export class TaskService {
+  private sync = inject(CrossTabSync);
+  // ... existing code ...
+
+  constructor() {
+    effect(() => { try { localStorage.setItem('tasks', JSON.stringify(this._tasks())); } catch {} });
+
+    // receive: another tab changed the list
+    effect(() => {
+      const incoming = this.sync.last() as Task[] | null;
+      if (incoming) this._tasks.set(incoming);
+    });
+  }
+
+  add(title: string, priority: number) {
+    this._tasks.update(l => [...l, { id: Date.now(), title, priority, done: false }]);
+    this.sync.post(this._tasks());          // send ONLY from user actions
+  }
+  // same one-line `this.sync.post(this._tasks())` after toggle / remove / clearCompleted / update
+}
+```
+
+Dynamic widgets on the board page:
+
+```ts
+widgets = [
+  { component: StatsBarComponent, inputs: {} },
+  { component: HighPriorityListComponent, inputs: { minPriority: 4 } },
+];
+```
+
+```html
+@for (w of widgets; track w.component) {
+  <ng-container [ngComponentOutlet]="w.component" [ngComponentOutletInputs]="w.inputs" />
+}
+```
+
+Directive and dialog tests:
+
+```ts
+it('emits only for outside clicks', () => {
+  @Component({
+    imports: [ClickOutsideDirective],
+    template: `<div appClickOutside (clickOutside)="hits = hits + 1"><button id="in">in</button></div><p id="out">out</p>`,
+  })
+  class Host { hits = 0; }
+
+  const f = TestBed.createComponent(Host);
+  f.detectChanges();
+  f.nativeElement.querySelector('#in').click();
+  expect(f.componentInstance.hits).toBe(0);
+  f.nativeElement.querySelector('#out').click();
+  expect(f.componentInstance.hits).toBe(1);
 });
 ```
 
